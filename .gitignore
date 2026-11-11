@@ -1,8 +1,10 @@
 # Environment variables and secrets
 .env
 .cache
+.local/
 .spotify_cache
 .spotipyoauthcache
+.pytest_cache/
 
 # Python bytecode & virtual environments
 __pycache__/

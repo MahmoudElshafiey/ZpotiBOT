@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import shutil
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Dict, Any
 
 import discord
@@ -10,7 +12,6 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import spotipy
 from spotipy.exceptions import SpotifyException
-import yt_dlp
 
 from spotify_auth import (
     DEFAULT_CACHE_PATH,
@@ -22,10 +23,38 @@ from spotify_auth import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("ZpotiBot")
 
+# Keep third-party logs quiet: less console I/O and less disk usage on hosts
+# that capture stdout to a log file.
+logging.getLogger("discord").setLevel(logging.WARNING)
+logging.getLogger("yt_dlp").setLevel(logging.WARNING)
+
 load_dotenv()
 
 DISCORD_TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip().strip("'\"")
 SPOTIFY_REFRESH_TOKEN = (os.getenv("SPOTIFY_REFRESH_TOKEN") or "").strip().strip("'\"")
+
+
+def _env_number(name: str, default: float, cast=float):
+    """Reads a numeric env var, falling back to a default for invalid values."""
+    try:
+        return cast(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        logger.warning("Invalid value for %s; using default %s.", name, default)
+        return default
+
+
+# Free-tier tuning knobs.
+# 10s polling is enough for presence/auto-sync and halves API + CPU churn.
+SPOTIFY_POLL_SECONDS = max(3.0, _env_number("SPOTIFY_POLL_SECONDS", 10.0))
+# Each voice stream is a separate FFmpeg process (~30-60 MB). Keep this low on 256 MB RAM.
+MAX_VOICE_STREAMS = max(1, int(_env_number("MAX_VOICE_STREAMS", 2, int)))
+# Resolved YouTube URLs stay valid for hours, so cache them briefly.
+STREAM_CACHE_TTL = 3 * 60 * 60
+STREAM_CACHE_MAX = 32
+
+# Bounded pool for blocking Spotify/yt-dlp work. The default executor can grow to
+# min(32, cpu + 4) threads, which wastes memory through per-thread arenas/stacks.
+IO_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="zpoti-io")
 
 
 def get_ffmpeg_binary() -> str:
@@ -136,56 +165,132 @@ def search_spotify_track(query: str, sp: Optional[spotipy.Spotify]) -> Optional[
     return None
 
 
+# Resolved stream URLs are valid for hours; reuse them for repeated tracks.
+_stream_cache: Dict[str, Any] = {}
+_ydl_lock: Optional[asyncio.Lock] = None
+
+
+def trim_process_memory() -> None:
+    """Returns freed glibc arenas to the OS after heavy yt-dlp allocations (Linux only)."""
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _cached_stream(cache_key: str) -> Optional[Dict[str, Any]]:
+    entry = _stream_cache.get(cache_key)
+    if not entry:
+        return None
+    timestamp, info = entry
+    if time.monotonic() - timestamp > STREAM_CACHE_TTL:
+        _stream_cache.pop(cache_key, None)
+        return None
+    return info
+
+
+def _store_stream(cache_key: str, info: Dict[str, Any]) -> None:
+    now = time.monotonic()
+    for cached_key, (timestamp, _) in list(_stream_cache.items()):
+        if now - timestamp > STREAM_CACHE_TTL:
+            _stream_cache.pop(cached_key, None)
+    if len(_stream_cache) >= STREAM_CACHE_MAX:
+        oldest_key = min(_stream_cache, key=lambda key: _stream_cache[key][0])
+        _stream_cache.pop(oldest_key, None)
+    _stream_cache[cache_key] = (now, info)
+
+
 async def fetch_youtube_stream(track: dict) -> Optional[Dict[str, Any]]:
-    """Searches YouTube using yt-dlp using Spotify track metadata to extract direct audio stream URL."""
+    """Resolves a YouTube audio URL for a Spotify track.
+
+    Extraction is serialized, cached for a few hours, and runs on a small bounded
+    thread pool. yt-dlp is imported lazily so an idle bot does not pay its memory cost.
+    """
+    global _ydl_lock
+    if _ydl_lock is None:
+        _ydl_lock = asyncio.Lock()
+
     track_name = track.get("name", "Unknown Track")
     artists_list = [artist.get("name") for artist in track.get("artists", []) if artist.get("name")]
     artists_str = ", ".join(artists_list) or "Unknown Artist"
     search_query = f"{track_name} {artists_str}".strip()
+    cache_key = str(track.get("id") or track.get("uri") or f"{track_name}|{artists_str}")
 
-    logger.info("Extracting YouTube audio stream for Spotify track: '%s' by '%s'...", track_name, artists_str)
+    cached = _cached_stream(cache_key)
+    if cached:
+        logger.info("Reusing cached YouTube stream for '%s' by '%s'.", track_name, artists_str)
+        return cached
 
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "default_search": "ytsearch",
-        "extract_flat": False,
-    }
+    # Only one yt-dlp extraction at a time: avoids doubling peak RAM when /play
+    # and the auto-sync poller resolve tracks concurrently.
+    async with _ydl_lock:
+        cached = _cached_stream(cache_key)
+        if cached:
+            return cached
 
-    loop = asyncio.get_running_loop()
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            search_target = f"ytsearch1:{search_query} audio"
-            info = await loop.run_in_executor(
-                None, lambda: ydl.extract_info(search_target, download=False)
-            )
-            if info and "entries" in info and info["entries"]:
-                entry = info["entries"][0]
-                audio_url = entry.get("url")
-                if audio_url:
-                    return {
-                        "audio_url": audio_url,
-                        "title": entry.get("title", track_name),
-                        "webpage_url": entry.get("webpage_url", ""),
-                        "thumbnail": entry.get("thumbnail"),
-                        "track_name": track_name,
-                        "artists_str": artists_str,
-                    }
-    except Exception as exc:
-        logger.error("yt-dlp extraction failed for '%s': %s", search_query, exc)
+        logger.info("Extracting YouTube audio stream for Spotify track: '%s' by '%s'...", track_name, artists_str)
 
-    return None
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "no_color": True,
+            "cachedir": False,
+            "default_search": "ytsearch",
+            "extract_flat": False,
+        }
+        search_target = f"ytsearch1:{search_query} audio"
+
+        def extract() -> Optional[Dict[str, Any]]:
+            import yt_dlp  # deferred import keeps idle memory lower
+
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    return ydl.extract_info(search_target, download=False)
+            finally:
+                trim_process_memory()
+
+        loop = asyncio.get_running_loop()
+        try:
+            info = await loop.run_in_executor(IO_EXECUTOR, extract)
+        except Exception as exc:
+            logger.error("yt-dlp extraction failed for '%s': %s", search_query, exc)
+            return None
+
+        if not info or not info.get("entries"):
+            return None
+
+        entry = info["entries"][0]
+        audio_url = entry.get("url")
+        if not audio_url:
+            return None
+
+        result = {
+            "audio_url": audio_url,
+            "title": entry.get("title", track_name),
+            "webpage_url": entry.get("webpage_url", ""),
+            "thumbnail": entry.get("thumbnail"),
+            "track_name": track_name,
+            "artists_str": artists_str,
+        }
+        _store_stream(cache_key, result)
+        return result
 
 
 async def stream_to_voice_client(voice_client: discord.VoiceClient, stream_info: Dict[str, Any]) -> bool:
     """Streams audio to an active discord.VoiceClient using resolved FFmpeg."""
     ffmpeg_exe = get_ffmpeg_binary()
+    # -threads 1 caps decoder threads/buffers; -loglevel error silences FFmpeg and
+    # overrides discord.py's default warning level.
     ffmpeg_options = {
         "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-        "options": "-vn",
+        "options": "-vn -threads 1 -loglevel error",
     }
+    audio_source: Optional[discord.FFmpegPCMAudio] = None
     try:
         if voice_client.is_playing() or voice_client.is_paused():
             voice_client.stop()
@@ -202,6 +307,8 @@ async def stream_to_voice_client(voice_client: discord.VoiceClient, stream_info:
         voice_client.play(audio_source, after=after_playback)
         return True
     except Exception as exc:
+        if audio_source is not None:
+            audio_source.cleanup()
         logger.error("Failed to stream to voice client with FFmpeg (%s): %s", ffmpeg_exe, exc)
         return False
 
@@ -243,6 +350,11 @@ async def play_audio(interaction: discord.Interaction, track: dict) -> bool:
         await interaction.followup.send(f"⚠️ Could not connect to voice channel: {exc}")
         return False
 
+    # Stop the old FFmpeg process before resolving the next track. This avoids
+    # holding an old decoder + a new yt-dlp extraction in memory at the same time.
+    if voice_client.is_playing() or voice_client.is_paused():
+        voice_client.stop()
+
     # Extract stream URL
     stream_info = await fetch_youtube_stream(track)
     if not stream_info:
@@ -277,14 +389,23 @@ async def play_audio(interaction: discord.Interaction, track: dict) -> bool:
 
 class SpotifyDiscordBot(commands.Bot):
     """Discord Bot class managing application slash commands, Spotify client,
-    5-second Spotify background status sync, and 10-minute alone voice auto-disconnect.
+    periodic Spotify status sync, and 10-minute alone voice auto-disconnect.
+
+    Only the guilds and voice-states intents are requested, and the message cache
+    is disabled: this bot has no message/prefix commands, so caching messages only
+    wastes RAM on small hosting plans.
     """
 
     def __init__(self):
-        intents = discord.Intents.default()
-        intents.message_content = True
+        intents = discord.Intents.none()
+        intents.guilds = True
         intents.voice_states = True
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            max_messages=None,
+            member_cache_flags=discord.MemberCacheFlags.from_intents(intents),
+        )
 
         self.sp: Optional[spotipy.Spotify] = None
         self.last_track_id: Optional[str] = None
@@ -321,6 +442,7 @@ class SpotifyDiscordBot(commands.Bot):
             self.spotify_poller.cancel()
         if self.inactivity_poller.is_running():
             self.inactivity_poller.cancel()
+        IO_EXECUTOR.shutdown(wait=False, cancel_futures=True)
         await super().close()
 
     async def on_ready(self):
@@ -370,9 +492,9 @@ class SpotifyDiscordBot(commands.Bot):
     async def before_inactivity_poller(self):
         await self.wait_until_ready()
 
-    @tasks.loop(seconds=5.0)
+    @tasks.loop(seconds=SPOTIFY_POLL_SECONDS)
     async def spotify_poller(self):
-        """Polls Spotify's /me/player/currently-playing endpoint every 5 seconds.
+        """Polls Spotify's /me/player/currently-playing endpoint periodically.
         Reflects changes in the bot's presence and synchronizes voice streaming if active.
         """
         sp = self.ensure_spotify()
@@ -381,7 +503,7 @@ class SpotifyDiscordBot(commands.Bot):
 
         loop = asyncio.get_running_loop()
         try:
-            playback = await loop.run_in_executor(None, sp.currently_playing)
+            playback = await loop.run_in_executor(IO_EXECUTOR, sp.currently_playing)
         except SpotifyException as exc:
             logger.warning("Spotify polling API error: %s", exc)
             return
@@ -421,13 +543,26 @@ class SpotifyDiscordBot(commands.Bot):
                 )
             )
 
-            # Auto-sync to connected voice channels if enabled
+            # Auto-sync to connected voice channels if enabled. Cap the number of
+            # simultaneous FFmpeg streams so a multi-guild bot cannot exhaust 256 MB.
             if self.auto_sync_voice and is_playing and self.voice_clients:
-                logger.info("Auto-syncing new Spotify track to %d voice channel(s)...", len(self.voice_clients))
-                stream_info = await fetch_youtube_stream(item)
-                if stream_info:
-                    for vc in self.voice_clients:
-                        if vc.is_connected():
+                connected = [vc for vc in self.voice_clients if vc.is_connected()]
+                if len(connected) > MAX_VOICE_STREAMS:
+                    logger.warning(
+                        "Auto-sync limited to %d of %d connected voice channel(s) (MAX_VOICE_STREAMS).",
+                        MAX_VOICE_STREAMS,
+                        len(connected),
+                    )
+                targets = connected[:MAX_VOICE_STREAMS]
+                if targets:
+                    logger.info("Auto-syncing new Spotify track to %d voice channel(s)...", len(targets))
+                    # Free the old FFmpeg processes before yt-dlp allocates for the new track.
+                    for vc in targets:
+                        if vc.is_playing() or vc.is_paused():
+                            vc.stop()
+                    stream_info = await fetch_youtube_stream(item)
+                    if stream_info:
+                        for vc in targets:
                             await stream_to_voice_client(vc, stream_info)
 
         elif is_playing != self.last_is_playing:
