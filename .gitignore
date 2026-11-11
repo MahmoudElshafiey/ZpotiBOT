@@ -6,6 +6,12 @@
 .spotipyoauthcache
 .pytest_cache/
 
+# yt-dlp YouTube cookies: these are account credentials, never commit them
+cookies.txt
+*cookies*.txt
+.ytdlp_cookies.txt
+.cookies/
+
 # Python bytecode & virtual environments
 __pycache__/
 *.py[cod]

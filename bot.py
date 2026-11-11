@@ -33,6 +33,23 @@ load_dotenv()
 DISCORD_TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip().strip("'\"")
 SPOTIFY_REFRESH_TOKEN = (os.getenv("SPOTIFY_REFRESH_TOKEN") or "").strip().strip("'\"")
 
+# Directory containing bot.py. Used to find cookies.txt regardless of the
+# process working directory chosen by the hosting panel.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Reads a boolean env var, accepting 1/true/yes/on and 0/false/no/off."""
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on", "y"}:
+        return True
+    if raw in {"0", "false", "no", "off", "n"}:
+        return False
+    logger.warning("Invalid boolean for %s (%r); using default %s.", name, raw, default)
+    return default
+
 
 def _env_number(name: str, default: float, cast=float):
     """Reads a numeric env var, falling back to a default for invalid values."""
@@ -55,6 +72,127 @@ STREAM_CACHE_MAX = 32
 # Bounded pool for blocking Spotify/yt-dlp work. The default executor can grow to
 # min(32, cpu + 4) threads, which wastes memory through per-thread arenas/stacks.
 IO_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="zpoti-io")
+
+
+def _resolve_cookie_file() -> Optional[str]:
+    """Finds a Netscape-format cookies file for yt-dlp.
+
+    Priority:
+      1. ``YTDLP_COOKIES_FILE`` (absolute, or relative to bot.py)
+      2. ``YTDLP_COOKIES_B64`` (base64 contents, written to a runtime file)
+      3. ``cookies.txt`` next to bot.py
+
+    Cookies let YouTube see a real signed-in session, which is the reliable way
+    around the "Sign in to confirm you're not a bot" wall on datacenter IPs.
+    """
+    env_path = (os.getenv("YTDLP_COOKIES_FILE") or "").strip().strip("'\"")
+    if env_path:
+        path = env_path if os.path.isabs(env_path) else os.path.join(BASE_DIR, env_path)
+        if os.path.isfile(path):
+            return path
+        logger.warning("YTDLP_COOKIES_FILE points to a missing file: %s", path)
+
+    encoded = (os.getenv("YTDLP_COOKIES_B64") or "").strip()
+    if encoded:
+        try:
+            import base64
+
+            target = os.path.join(BASE_DIR, ".ytdlp_cookies.txt")
+            with open(target, "wb") as fh:
+                fh.write(base64.b64decode(encoded))
+            try:
+                os.chmod(target, 0o600)
+            except OSError:
+                pass
+            return target
+        except Exception as exc:
+            logger.warning("Could not decode YTDLP_COOKIES_B64: %s", exc)
+
+    auto_path = os.path.join(BASE_DIR, "cookies.txt")
+    if os.path.isfile(auto_path):
+        return auto_path
+    return None
+
+
+YTDLP_COOKIES_FILE = _resolve_cookie_file()
+# yt-dlp -4 equivalent. Datacenter IPv6 ranges are scored more harshly by YouTube.
+YTDLP_FORCE_IPV4 = _env_bool("YTDLP_FORCE_IPV4", True)
+# Optional comma-separated override, e.g. "tv_samsung" or "visionos,web_embedded".
+YTDLP_PLAYER_CLIENT = (os.getenv("YTDLP_PLAYER_CLIENT") or "").strip().strip("'\"")
+# Optional proxy for extraction only (does not affect Discord/Spotify traffic).
+YTDLP_PROXY = (os.getenv("YTDLP_PROXY") or "").strip().strip("'\"")
+
+if YTDLP_COOKIES_FILE:
+    logger.info("Using yt-dlp cookies file: %s", YTDLP_COOKIES_FILE)
+else:
+    logger.info("No yt-dlp cookies file configured; YouTube requests will be anonymous.")
+
+BOT_WALL_MARKERS = (
+    "sign in to confirm",
+    "not a bot",
+    "confirm you're not a bot",
+    "confirm you’re not a bot",
+)
+
+
+def is_bot_wall_error(message: str) -> bool:
+    """Detects YouTube's datacenter-IP bot wall in a yt-dlp error string."""
+    lowered = (message or "").lower()
+    return any(marker in lowered for marker in BOT_WALL_MARKERS)
+
+
+def describe_ytdlp_failure(message: str) -> str:
+    """Turns the raw yt-dlp error into an actionable explanation when possible."""
+    if is_bot_wall_error(message):
+        return (
+            "YouTube is blocking this host with a bot check. Upload a Netscape-format "
+            "cookies.txt from a throwaway Google account (or set YTDLP_COOKIES_FILE / "
+            "YTDLP_COOKIES_B64) and restart the bot. If it still fails, set YTDLP_PROXY "
+            "or try YTDLP_PLAYER_CLIENT. Run /ytcheck for details."
+        )
+    return message
+
+
+def build_ydl_opts() -> Dict[str, Any]:
+    """Builds yt-dlp options, including cookies/IPv4/client/proxy overrides."""
+    opts: Dict[str, Any] = {
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "color": {"stdout": "no_color", "stderr": "no_color"},
+        "cachedir": False,
+        "default_search": "ytsearch",
+        "extract_flat": False,
+        # Fail fast: a blocked host should not sit in retries for a minute.
+        "retries": 3,
+        "fragment_retries": 3,
+        "extractor_retries": 2,
+        "socket_timeout": 20,
+    }
+    if YTDLP_COOKIES_FILE:
+        opts["cookiefile"] = YTDLP_COOKIES_FILE
+    if YTDLP_FORCE_IPV4:
+        opts["source_address"] = "0.0.0.0"
+    if YTDLP_PLAYER_CLIENT:
+        clients = [client.strip() for client in YTDLP_PLAYER_CLIENT.split(",") if client.strip()]
+        if clients:
+            opts["extractor_args"] = {"youtube": {"player_client": clients}}
+    if YTDLP_PROXY:
+        opts["proxy"] = YTDLP_PROXY
+    return opts
+
+
+def extract_with_ytdlp(search_target: str) -> Optional[Dict[str, Any]]:
+    """Blocking yt-dlp extraction, run on IO_EXECUTOR."""
+    import yt_dlp  # deferred import keeps idle memory lower
+
+    try:
+        with yt_dlp.YoutubeDL(build_ydl_opts()) as ydl:
+            return ydl.extract_info(search_target, download=False)
+    finally:
+        trim_process_memory()
 
 
 def get_ffmpeg_binary() -> str:
@@ -168,6 +306,16 @@ def search_spotify_track(query: str, sp: Optional[spotipy.Spotify]) -> Optional[
 # Resolved stream URLs are valid for hours; reuse them for repeated tracks.
 _stream_cache: Dict[str, Any] = {}
 _ydl_lock: Optional[asyncio.Lock] = None
+# Last yt-dlp failure, surfaced by /play and /ytcheck.
+_last_ytdlp_error: Optional[str] = None
+
+
+def _get_ydl_lock() -> asyncio.Lock:
+    """Returns the process-wide extraction lock, creating it on first use."""
+    global _ydl_lock
+    if _ydl_lock is None:
+        _ydl_lock = asyncio.Lock()
+    return _ydl_lock
 
 
 def trim_process_memory() -> None:
@@ -208,9 +356,7 @@ async def fetch_youtube_stream(track: dict) -> Optional[Dict[str, Any]]:
     Extraction is serialized, cached for a few hours, and runs on a small bounded
     thread pool. yt-dlp is imported lazily so an idle bot does not pay its memory cost.
     """
-    global _ydl_lock
-    if _ydl_lock is None:
-        _ydl_lock = asyncio.Lock()
+    global _last_ytdlp_error
 
     track_name = track.get("name", "Unknown Track")
     artists_list = [artist.get("name") for artist in track.get("artists", []) if artist.get("name")]
@@ -225,43 +371,30 @@ async def fetch_youtube_stream(track: dict) -> Optional[Dict[str, Any]]:
 
     # Only one yt-dlp extraction at a time: avoids doubling peak RAM when /play
     # and the auto-sync poller resolve tracks concurrently.
-    async with _ydl_lock:
+    async with _get_ydl_lock():
         cached = _cached_stream(cache_key)
         if cached:
             return cached
 
         logger.info("Extracting YouTube audio stream for Spotify track: '%s' by '%s'...", track_name, artists_str)
-
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "noprogress": True,
-            "no_color": True,
-            "cachedir": False,
-            "default_search": "ytsearch",
-            "extract_flat": False,
-        }
         search_target = f"ytsearch1:{search_query} audio"
-
-        def extract() -> Optional[Dict[str, Any]]:
-            import yt_dlp  # deferred import keeps idle memory lower
-
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    return ydl.extract_info(search_target, download=False)
-            finally:
-                trim_process_memory()
 
         loop = asyncio.get_running_loop()
         try:
-            info = await loop.run_in_executor(IO_EXECUTOR, extract)
+            info = await loop.run_in_executor(IO_EXECUTOR, extract_with_ytdlp, search_target)
         except Exception as exc:
-            logger.error("yt-dlp extraction failed for '%s': %s", search_query, exc)
+            message = str(exc)
+            _last_ytdlp_error = message
+            if is_bot_wall_error(message):
+                logger.error("YouTube bot check blocked '%s': %s", search_query, describe_ytdlp_failure(message))
+            else:
+                logger.error("yt-dlp extraction failed for '%s': %s", search_query, message)
             return None
 
+        _last_ytdlp_error = None
+
         if not info or not info.get("entries"):
+            _last_ytdlp_error = "yt-dlp returned no search results."
             return None
 
         entry = info["entries"][0]
@@ -358,7 +491,15 @@ async def play_audio(interaction: discord.Interaction, track: dict) -> bool:
     # Extract stream URL
     stream_info = await fetch_youtube_stream(track)
     if not stream_info:
-        await interaction.followup.send(f"🔍 Could not find an audio stream matching Spotify track **{track_name}**.")
+        if _last_ytdlp_error and is_bot_wall_error(_last_ytdlp_error):
+            await interaction.followup.send(
+                f"🚫 YouTube blocked this host with a bot check while resolving **{track_name}**.\n"
+                "Upload a Netscape-format `cookies.txt` from a throwaway Google account "
+                "(or set `YTDLP_COOKIES_FILE`), then restart the bot and run `/ytcheck`.\n"
+                "See the README's *YouTube bot check* section."
+            )
+        else:
+            await interaction.followup.send(f"🔍 Could not find an audio stream matching Spotify track **{track_name}**.")
         return False
 
     # Stream to voice
@@ -612,6 +753,63 @@ async def status(interaction: discord.Interaction):
         f"• **Active Spotify Track:** {bot.last_track_id or 'None / Idle'}"
     )
     await interaction.response.send_message(message)
+
+
+@bot.tree.command(name="ytcheck", description="Test YouTube extraction and show yt-dlp cookie/IPv4 settings (admin only)")
+@app_commands.default_permissions(administrator=True)
+async def ytcheck(interaction: discord.Interaction):
+    """Runs one test extraction so admins can verify the host can reach YouTube."""
+    permissions = getattr(interaction, "permissions", None)
+    if interaction.guild is None or not getattr(permissions, "administrator", False):
+        await interaction.response.send_message(
+            "⚠️ Only server administrators can run this check.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    config = (
+        f"• **Cookies:** {'yes (`' + os.path.basename(YTDLP_COOKIES_FILE) + '`)' if YTDLP_COOKIES_FILE else 'no'}\n"
+        f"• **Force IPv4:** {'yes' if YTDLP_FORCE_IPV4 else 'no'}\n"
+        f"• **Player client:** {YTDLP_PLAYER_CLIENT or 'yt-dlp default'}\n"
+        f"• **Proxy:** {'configured' if YTDLP_PROXY else 'none'}"
+    )
+
+    loop = asyncio.get_running_loop()
+    started = time.perf_counter()
+    try:
+        async with _get_ydl_lock():
+            info = await loop.run_in_executor(
+                IO_EXECUTOR, extract_with_ytdlp, "ytsearch1:Never Gonna Give You Up Rick Astley audio"
+            )
+    except Exception as exc:
+        message = str(exc)
+        elapsed = time.perf_counter() - started
+        logger.error("ytcheck extraction failed: %s", message)
+        await interaction.followup.send(
+            f"❌ **YouTube extraction failed** after `{elapsed:.1f}s`.\n"
+            f"**Reason:** {describe_ytdlp_failure(message)[:1500]}\n\n"
+            f"**Current settings**\n{config}",
+            ephemeral=True,
+        )
+        return
+
+    elapsed = time.perf_counter() - started
+    entry = info["entries"][0] if info and info.get("entries") else None
+    if not entry or not entry.get("url"):
+        await interaction.followup.send(
+            f"❌ **YouTube returned no playable stream** after `{elapsed:.1f}s`.\n\n"
+            f"**Current settings**\n{config}",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(
+        f"✅ **YouTube extraction works** in `{elapsed:.1f}s`.\n"
+        f"**Test result:** {entry.get('title', 'unknown title')[:200]}\n\n"
+        f"**Current settings**\n{config}",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="play", description="Search Spotify for a song and play it in your voice channel")
