@@ -1,6 +1,8 @@
 discord.py[voice]>=2.3.2,<3
 spotipy>=2.23.0,<3
 python-dotenv>=1.0.1,<2
-yt-dlp>=2024.3.10
+# 2026.08.19 added the token-free `visionos` client; some videos only expose
+# audio through it. Requires Python 3.10+ (3.11+ for the newest release).
+yt-dlp>=2026.10.21
 # Pin below 0.8: 0.8.x bundles a ~165 MB FFmpeg binary, 0.7.x is ~76 MB.
 imageio-ffmpeg>=0.4.9,<0.8

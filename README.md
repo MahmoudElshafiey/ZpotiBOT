@@ -22,11 +22,11 @@ A Discord bot for Spotify music search, voice playback, and playback status sync
 | `/nowplaying` | Displays an embed with current Spotify track, artist, album, and progress bar. |
 | `/autosync <enabled>` | Toggles whether changing tracks on your Spotify app auto-streams into voice. |
 | `/status` | Checks bot health, latency, Spotify connectivity, and voice inactivity state. |
-| `/ytcheck` | Admin-only: runs one YouTube extraction and reports cookies/IPv4/player-client/proxy status. |
+| `/ytcheck` | Admin-only: tests anonymous `visionos` and cookie extraction, and reports yt-dlp version/cookies/IPv4/player-client/proxy status. |
 
 ## Setup & Deployment
 
-1. **Install dependencies:**
+1. **Install dependencies** (Python 3.10+ required, 3.11+ recommended):
    ```powershell
    pip install -r requirements.txt
    ```
@@ -72,6 +72,49 @@ This bot is tuned to fit small plans such as **256 MB RAM / 512 MB disk**.
   - `MAX_VOICE_STREAMS` (default `2`) — cap on simultaneous voice channels, since each
     stream is a separate FFmpeg process.
 
+## YouTube playback errors
+
+The bot resolves audio with `yt-dlp` in a fixed order:
+
+1. **Anonymous `visionos` client** (no cookies). This client is token-free, so it
+   usually avoids the bot wall, and it exposes audio that the other clients hide.
+2. **Cookie clients** (`web_safari`, then `tv`) — only when a cookies file is configured.
+3. **Anonymous `web_safari`, then yt-dlp's default clients** — only when no cookies
+   are configured.
+
+`visionos` is tried **before** cookies on purpose: yt-dlp drops that client as soon as
+the cookie file contains a signed-in session, and for many videos the authenticated
+clients return storyboard images with no audio at all.
+
+### `Requested format is not available`
+
+If logs show:
+
+```
+ERROR: [youtube] x8plegt7Kf8: Requested format is not available.
+```
+
+YouTube returned formats for the video, but none of them was playable audio — usually
+because the client only exposed storyboard images. Fixes, in order:
+
+1. **Update yt-dlp.** `requirements.txt` requires `yt-dlp>=2026.10.21`, the first
+   release with the `visionos` client that still supports Python 3.10. Newer releases
+   (`2026.10.26+`) need Python 3.11+. Check with `python -m yt_dlp --version` and
+   `python --version`, then reinstall:
+   ```bash
+   pip install -U -r requirements.txt
+   ```
+2. **Restart the bot and run `/ytcheck`.** It reports the yt-dlp version and tests
+   the anonymous `visionos` mode and, when configured, the cookie mode.
+3. If the cookie mode is the one returning no audio, that is expected for these
+   tracks: the bot already tries anonymous `visionos` first, so leave
+   `YTDLP_PLAYER_CLIENT` empty and cookies will only be used when `visionos` is blocked.
+4. If a single track still fails in every mode, it has no usable audio source; play
+   another search result instead.
+
+`YTDLP_PLAYER_CLIENT` overrides the whole chain when set. Leave it empty unless you
+are debugging — pinning an old client such as `tv_samsung` is what causes this error.
+
 ## YouTube bot check
 
 If logs show:
@@ -81,9 +124,10 @@ ERROR: [youtube] ...: Sign in to confirm you're not a bot.
 ```
 
 YouTube is refusing the host's IP, not the song. Shared/datacenter IPs are commonly
-flagged. The bot applies two fixes automatically, and supports two optional overrides.
+flagged. The bot tries the token-free `visionos` client first, then applies cookies
+when a cookies file is configured, and supports two optional overrides.
 
-### 1. Export cookies (highest chance of success)
+### 1. Export cookies (when the anonymous client is blocked)
 
 Use a **throwaway Google account**, never your main account.
 
@@ -109,20 +153,38 @@ committed. Re-export them if playback breaks again after a few days/weeks.
 
 - `YTDLP_PLAYER_CLIENT` — comma-separated yt-dlp client override, e.g.
   `tv_samsung`, `visionos`, or `web_embedded`. Clients are scored differently and
-  change every few weeks.
+  change every few weeks. Leave it empty to use the `visionos`-first chain described
+  in [YouTube playback errors](#youtube-playback-errors).
 - `YTDLP_PROXY` — proxy used only for yt-dlp extraction, e.g.
   `http://user:pass@host:port`. A residential/mobile proxy is the durable fix when
   the host IP itself is flagged and cookies alone stop working.
 
 ### Host-side test
 
-Before restarting the bot, you can test the host Shell directly:
+Before restarting the bot, you can test the host Shell directly. First confirm the
+version — `2026.10.21` or newer is required:
 
 ```bash
-python -m yt_dlp -4 --cookies cookies.txt --no-playlist -f bestaudio -g \
+python --version
+python -m yt_dlp --version
+```
+
+Then test the same mode the bot uses first (anonymous `visionos`):
+
+```bash
+python -m yt_dlp -4 --no-warnings --no-playlist -f bestaudio/best -g \
+  --extractor-args "youtube:player_client=visionos" \
   "ytsearch1:bu dünya yıkılsa üzülmem TUANA"
 ```
 
-If that prints a URL, the bot will work once it is restarted with the same
-`cookies.txt`. If it still fails, the IP is flagged and `YTDLP_PROXY` or a different
-host is required.
+If that prints a URL, the bot will play without cookies. If it only reports a bot
+check, test the cookie fallback:
+
+```bash
+python -m yt_dlp -4 --cookies cookies.txt --no-warnings --no-playlist -f bestaudio/best -g \
+  --extractor-args "youtube:player_client=web_safari" \
+  "ytsearch1:bu dünya yıkılsa üzülmem TUANA"
+```
+
+If the cookie test fails too, the IP is flagged and `YTDLP_PROXY` or a different host
+is required.
