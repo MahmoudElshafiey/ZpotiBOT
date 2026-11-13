@@ -1,10 +1,13 @@
 import asyncio
 import logging
 import os
+import shlex
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
+from urllib.parse import urlsplit, urlunsplit
 
 import discord
 from discord import app_commands
@@ -119,13 +122,186 @@ YTDLP_COOKIES_FILE = _resolve_cookie_file()
 YTDLP_FORCE_IPV4 = _env_bool("YTDLP_FORCE_IPV4", True)
 # Optional comma-separated override, e.g. "tv_samsung" or "visionos,web_embedded".
 YTDLP_PLAYER_CLIENT = (os.getenv("YTDLP_PLAYER_CLIENT") or "").strip().strip("'\"")
-# Optional proxy for extraction only (does not affect Discord/Spotify traffic).
+# Optional proxy for extraction (does not affect Discord/Spotify traffic).
 YTDLP_PROXY = (os.getenv("YTDLP_PROXY") or "").strip().strip("'\"")
+# FFmpeg fetches the resolved googlevideo URL separately, and those URLs are bound
+# to the IP that extracted them. When a proxy is used for extraction, the audio
+# stream must go through it too or YouTube answers 403.
+FFMPEG_PROXY = (os.getenv("FFMPEG_PROXY") or "").strip().strip("'\"") or YTDLP_PROXY
+# Cookie policy: "auto" skips cookies when a proxy is configured, because a
+# signed-in session makes yt-dlp drop the token-free `visionos` client and leaves
+# only clients that YouTube serves via SABR (no direct audio URLs).
+YTDLP_USE_COOKIES = (os.getenv("YTDLP_USE_COOKIES") or "auto").strip().lower()
+if YTDLP_USE_COOKIES not in {"auto", "always", "never"}:
+    logger.warning("Invalid YTDLP_USE_COOKIES=%r; using 'auto'.", YTDLP_USE_COOKIES)
+    YTDLP_USE_COOKIES = "auto"
+
+_ffmpeg_proxy_warned = False
+_ffmpeg_proxy_auth_warned = False
+
+
+def mask_proxy(proxy: str) -> str:
+    """Hides proxy credentials before they reach a log line or Discord embed."""
+    if not proxy:
+        return ""
+    try:
+        parts = urlsplit(proxy)
+        if not parts.hostname:
+            return "configured"
+        host = parts.hostname
+        if parts.port:
+            host = f"{host}:{parts.port}"
+        if parts.username or parts.password:
+            host = f"***@{host}"
+        return urlunsplit((parts.scheme, host, parts.path, "", ""))
+    except Exception:
+        return "configured"
+
+
+def cookies_enabled() -> bool:
+    """Decides whether extraction attempts may use cookiefile."""
+    if not YTDLP_COOKIES_FILE or YTDLP_USE_COOKIES == "never":
+        return False
+    if YTDLP_USE_COOKIES == "always":
+        return True
+    # auto: a proxy makes anonymous clients work and avoids the SABR-only clients.
+    return not YTDLP_PROXY
+
+
+_COOKIE_SESSION_NAMES = ("LOGIN_INFO",)
+_COOKIE_SAPISID_NAMES = ("SAPISID", "__Secure-1PAPISID", "__Secure-3PAPISID")
+
+
+def cookie_session_status() -> tuple[str, Optional[str]]:
+    """Inspects the Netscape cookie file without importing yt-dlp.
+
+    Returns ``(state, expiry)`` where state is one of ``none``, ``unreadable``,
+    ``signed_in``, ``expired`` or ``logged_out``, and expiry is a date string for
+    the auth cookies (``None`` otherwise).
+    """
+    path = YTDLP_COOKIES_FILE
+    if not path:
+        return "none", None
+
+    names: set[str] = set()
+    expiries: list[int] = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            for _ in range(20000):  # bounded: cookie files are small
+                line = fh.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line or line.startswith("#") and not line.startswith("#HttpOnly_"):
+                    continue
+                if line.startswith("#HttpOnly_"):
+                    line = line[len("#HttpOnly_"):]
+                fields = line.split("\t")
+                if len(fields) < 7:
+                    continue
+                try:
+                    expiry = int(float(fields[4]))
+                except (TypeError, ValueError):
+                    expiry = 0
+                if fields[5] in _COOKIE_SESSION_NAMES or fields[5] in _COOKIE_SAPISID_NAMES:
+                    names.add(fields[5])
+                    expiries.append(expiry)
+    except OSError:
+        return "unreadable", None
+
+    has_login = any(name in names for name in _COOKIE_SESSION_NAMES)
+    has_sapisid = any(name in names for name in _COOKIE_SAPISID_NAMES)
+    if not (has_login and has_sapisid):
+        return "logged_out", None
+
+    now = time.time()
+    live = [expiry for expiry in expiries if expiry == 0 or expiry > now]
+    if not live:
+        newest = max(expiries) if expiries else 0
+        if newest:
+            expiry_date = datetime.fromtimestamp(newest, tz=timezone.utc).strftime("%Y-%m-%d")
+            return "expired", expiry_date
+        return "expired", None
+
+    newest_live = max(live)
+    expiry_date = (
+        datetime.fromtimestamp(newest_live, tz=timezone.utc).strftime("%Y-%m-%d")
+        if newest_live else None
+    )
+    return "signed_in", expiry_date
+
+
+def describe_cookie_session() -> str:
+    """Human-readable cookie state for /ytcheck and /play."""
+    state, expiry = cookie_session_status()
+    if state == "none":
+        return "none"
+    name = os.path.basename(YTDLP_COOKIES_FILE) if YTDLP_COOKIES_FILE else "cookies"
+    if state == "signed_in":
+        suffix = f", expires {expiry}" if expiry else ""
+        return f"signed in (`{name}`{suffix})"
+    if state == "expired":
+        suffix = f" on {expiry}" if expiry else ""
+        return f"expired{suffix} (`{name}`)"
+    if state == "logged_out":
+        return f"logged out (`{name}` — re-export from a signed-in browser)"
+    return f"unreadable (`{name}`)"
+
+
+def ffmpeg_proxy_args() -> str:
+    """Returns the FFmpeg ``-http_proxy`` arguments, or an empty string.
+
+    FFmpeg can only tunnel through an HTTP(S) proxy, and it does not send proxy
+    credentials from the URL, so both cases are reported once instead of failing
+    later with a misleading 403.
+    """
+    global _ffmpeg_proxy_warned, _ffmpeg_proxy_auth_warned
+    if not FFMPEG_PROXY:
+        return ""
+
+    parts = urlsplit(FFMPEG_PROXY)
+    scheme = (parts.scheme or "").lower()
+    if scheme.startswith("socks"):
+        if not _ffmpeg_proxy_warned:
+            logger.warning(
+                "FFmpeg cannot use a SOCKS proxy (%s). Point FFMPEG_PROXY at the "
+                "proxy's HTTP listener or playback will fail with 403.",
+                mask_proxy(FFMPEG_PROXY),
+            )
+            _ffmpeg_proxy_warned = True
+        return ""
+    if not scheme:
+        logger.warning(
+            "FFMPEG_PROXY/YTDLP_PROXY needs a scheme (http:// or socks5://); got %r.",
+            mask_proxy(FFMPEG_PROXY),
+        )
+        return ""
+    if (parts.username or parts.password) and not _ffmpeg_proxy_auth_warned:
+        logger.warning(
+            "FFmpeg does not send proxy credentials (%s). Run the proxy locally "
+            "without auth, or use an auth-forwarding local listener, otherwise "
+            "audio requests will return 403.",
+            mask_proxy(FFMPEG_PROXY),
+        )
+        _ffmpeg_proxy_auth_warned = True
+    return f"-http_proxy {shlex.quote(FFMPEG_PROXY)}"
+
 
 if YTDLP_COOKIES_FILE:
-    logger.info("Using yt-dlp cookies file: %s", YTDLP_COOKIES_FILE)
+    logger.info(
+        "Using yt-dlp cookies file: %s (session: %s)",
+        YTDLP_COOKIES_FILE, cookie_session_status()[0],
+    )
 else:
     logger.info("No yt-dlp cookies file configured; YouTube requests will be anonymous.")
+
+if FFMPEG_PROXY:
+    logger.info("Using proxy for yt-dlp and FFmpeg: %s", mask_proxy(FFMPEG_PROXY))
+if YTDLP_COOKIES_FILE and not cookies_enabled():
+    logger.info(
+        "Cookies are configured but disabled for extraction (policy=%s, proxy=%s).",
+        YTDLP_USE_COOKIES, "yes" if YTDLP_PROXY else "no",
+    )
 
 BOT_WALL_MARKERS = (
     "sign in to confirm",
@@ -204,21 +380,22 @@ def extraction_attempts() -> list[tuple[Optional[tuple[str, ...]], bool]]:
     """
     configured = _parse_clients(YTDLP_PLAYER_CLIENT)
     attempts: list[tuple[Optional[tuple[str, ...]], bool]] = []
+    use_cookies = cookies_enabled()
 
     if configured:
         # Cookies are skipped for visionos because yt-dlp would discard that
         # client when the cookie file makes the session authenticated.
-        attempts.append((configured, bool(YTDLP_COOKIES_FILE) and "visionos" not in configured))
+        attempts.append((configured, use_cookies and "visionos" not in configured))
 
     # Primary mode: anonymous (no cookies), token-free client.
     attempts.append((("visionos",), False))
 
     # Cookie fallback: clients that support cookies and may bypass the bot wall.
-    if YTDLP_COOKIES_FILE:
+    if use_cookies:
         attempts.append((("web_safari",), True))
         attempts.append((("tv",), True))
     else:
-        # Last-resort anonymous attempts when no cookie file is configured.
+        # Last-resort anonymous attempts when cookies are unavailable or disabled.
         attempts.append((("web_safari",), False))
         attempts.append((None, False))
 
@@ -519,14 +696,21 @@ async def fetch_youtube_stream(track: dict) -> Optional[Dict[str, Any]]:
         attempts = extraction_attempts()
         failure_kind: Optional[str] = None
         failure_message: Optional[str] = None
+        # Pin the video after the first successful search: retries must resolve the
+        # same video, not a fresh (possibly different) search result.
+        resolved_video_id: Optional[str] = None
 
         for index, (clients, use_cookies) in enumerate(attempts, start=1):
             label = "clients={}, cookies={}".format(
                 ",".join(clients) if clients else "default", "yes" if use_cookies else "no"
             )
+            target = (
+                f"https://www.youtube.com/watch?v={resolved_video_id}"
+                if resolved_video_id else search_target
+            )
             try:
                 info = await loop.run_in_executor(
-                    IO_EXECUTOR, extract_with_ytdlp, search_target, clients, use_cookies
+                    IO_EXECUTOR, extract_with_ytdlp, target, clients, use_cookies
                 )
             except Exception as exc:
                 message = str(exc)
@@ -551,6 +735,13 @@ async def fetch_youtube_stream(track: dict) -> Optional[Dict[str, Any]]:
                     index, len(attempts), search_query, label,
                 )
                 continue
+
+            if not resolved_video_id and entry.get("id"):
+                resolved_video_id = entry["id"]
+                logger.info(
+                    "Resolved '%s' to video %s; retries will reuse it.",
+                    search_query, resolved_video_id,
+                )
 
             audio_url = pick_audio_url(entry)
             if not audio_url:
@@ -594,8 +785,14 @@ async def stream_to_voice_client(voice_client: discord.VoiceClient, stream_info:
     ffmpeg_exe = get_ffmpeg_binary()
     # -threads 1 caps decoder threads/buffers; -loglevel error silences FFmpeg and
     # overrides discord.py's default warning level.
+    before_options = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+    proxy_args = ffmpeg_proxy_args()
+    if proxy_args:
+        # googlevideo URLs are bound to the extracting IP, so the stream must use
+        # the same proxy as yt-dlp or YouTube returns 403.
+        before_options = f"{before_options} {proxy_args}"
     ffmpeg_options = {
-        "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+        "before_options": before_options,
         "options": "-vn -threads 1 -loglevel error",
     }
     audio_source: Optional[discord.FFmpegPCMAudio] = None
@@ -619,6 +816,65 @@ async def stream_to_voice_client(voice_client: discord.VoiceClient, stream_info:
             audio_source.cleanup()
         logger.error("Failed to stream to voice client with FFmpeg (%s): %s", ffmpeg_exe, exc)
         return False
+
+
+def youtube_failure_advice(failure_kind: Optional[str], track_name: str) -> str:
+    """Builds an accurate, non-repetitive explanation for a failed extraction."""
+    cookie_state, _ = cookie_session_status()
+    signed_in = cookie_state == "signed_in"
+    cookie_note = describe_cookie_session()
+    proxy_note = mask_proxy(YTDLP_PROXY) if YTDLP_PROXY else ""
+
+    if failure_kind == "bot_wall":
+        if YTDLP_PROXY:
+            return (
+                f"🚫 YouTube refused the proxy's IP with a bot check while resolving **{track_name}**.\n"
+                f"• Proxy: `{proxy_note}`\n"
+                "Try another proxy exit (residential/mobile IPs work best), then run `/ytcheck`."
+            )
+        if signed_in:
+            return (
+                f"🚫 YouTube is blocking this host's IP while resolving **{track_name}**.\n"
+                "Your cookies are signed in, but they cannot fix this: signing in makes yt-dlp drop "
+                "`visionos`, the only client that still returns direct audio; the remaining clients "
+                "get image/SABR-only streams.\n"
+                "Fix: set `YTDLP_PROXY` to a proxy with a clean IP, or move to another host."
+            )
+        if cookie_state in {"logged_out", "expired"}:
+            return (
+                f"🚫 YouTube is blocking this host's IP while resolving **{track_name}**.\n"
+                f"• Cookies: {cookie_note}\n"
+                "Re-export them from a signed-in browser, but a flagged IP rarely recovers this way — "
+                "`YTDLP_PROXY` or another host is the durable fix."
+            )
+        return (
+            f"🚫 YouTube is blocking this host's IP while resolving **{track_name}**.\n"
+            "Cookies can sometimes help, but signing in also disables `visionos`, which is the only "
+            "client that still serves direct audio for many tracks.\n"
+            "Best fix: set `YTDLP_PROXY` to a proxy with a clean IP. Otherwise upload a `cookies.txt` "
+            "and run `/ytcheck`."
+        )
+
+    if failure_kind == "format":
+        if cookies_enabled():
+            return (
+                f"🎧 YouTube returned only image/SABR streams for **{track_name}**.\n"
+                "This is a YouTube-side change (yt-dlp issue #12482): signed-in clients get no direct "
+                "audio URL, so cookies make this worse, not better.\n"
+                "Fix: use an anonymous proxy (`YTDLP_PROXY`) and keep cookies disabled, then run `/ytcheck`."
+            )
+        return (
+            f"🎧 YouTube returned no playable audio format for **{track_name}**.\n"
+            "The bot tried the token-free `visionos` client and anonymous fallbacks.\n"
+            "Fix: update `yt-dlp` to `>=2026.10.21`, restart, and run `/ytcheck`. "
+            "If it still fails, try another search result."
+        )
+
+    detail = describe_ytdlp_failure(_last_ytdlp_error or "").strip()
+    return (
+        f"🔍 Could not find an audio stream matching Spotify track **{track_name}**."
+        + (f"\n> {detail[:300]}" if detail else "")
+    )
 
 
 async def play_audio(interaction: discord.Interaction, track: dict) -> bool:
@@ -666,27 +922,9 @@ async def play_audio(interaction: discord.Interaction, track: dict) -> bool:
     # Extract stream URL
     stream_info = await fetch_youtube_stream(track)
     if not stream_info:
-        if _last_ytdlp_failure_kind == "bot_wall":
-            await interaction.followup.send(
-                f"🚫 YouTube blocked this host with a bot check while resolving **{track_name}**.\n"
-                "Upload a Netscape-format `cookies.txt` from a throwaway Google account "
-                "(or set `YTDLP_COOKIES_FILE`), then restart the bot and run `/ytcheck`.\n"
-                "See the README's *YouTube bot check* section."
-            )
-        elif _last_ytdlp_failure_kind == "format":
-            await interaction.followup.send(
-                f"🎧 YouTube returned no playable audio format for **{track_name}**.\n"
-                "The bot tried the token-free `visionos` client first and, when configured, "
-                "cookie-based clients.\n"
-                "Fix: update `yt-dlp` to `>=2026.10.21`, then restart and run `/ytcheck`. "
-                "If it still fails, try a different search result."
-            )
-        else:
-            detail = describe_ytdlp_failure(_last_ytdlp_error or "").strip()
-            await interaction.followup.send(
-                f"🔍 Could not find an audio stream matching Spotify track **{track_name}**."
-                + (f"\n> {detail[:300]}" if detail else "")
-            )
+        await interaction.followup.send(
+            youtube_failure_advice(_last_ytdlp_failure_kind, track_name)
+        )
         return False
 
     # Stream to voice
@@ -955,12 +1193,17 @@ async def ytcheck(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
 
+    ffmpeg_proxy_auth = bool(FFMPEG_PROXY and urlsplit(FFMPEG_PROXY).username)
     config = (
         f"• **yt-dlp:** `{get_ytdlp_version()}`\n"
-        f"• **Cookies:** {'yes (`' + os.path.basename(YTDLP_COOKIES_FILE) + '`)' if YTDLP_COOKIES_FILE else 'no'}\n"
+        f"• **Cookies:** {describe_cookie_session()}\n"
+        f"• **Cookie policy:** {YTDLP_USE_COOKIES} "
+        f"({'used' if cookies_enabled() else 'disabled'})\n"
         f"• **Force IPv4:** {'yes' if YTDLP_FORCE_IPV4 else 'no'}\n"
-        f"• **Player client:** {YTDLP_PLAYER_CLIENT or 'auto (visionos first, then cookie clients)'}\n"
-        f"• **Proxy:** {'configured' if YTDLP_PROXY else 'none'}"
+        f"• **Player client:** {YTDLP_PLAYER_CLIENT or 'auto (visionos first, then fallbacks)'}\n"
+        f"• **Proxy (yt-dlp):** {mask_proxy(YTDLP_PROXY) or 'none'}\n"
+        f"• **Proxy (FFmpeg):** {mask_proxy(FFMPEG_PROXY) or 'none'}"
+        + (" — credentials not supported" if ffmpeg_proxy_auth else "")
     )
 
     loop = asyncio.get_running_loop()
@@ -1020,18 +1263,46 @@ async def ytcheck(interaction: discord.Interaction):
                 f"> {len(formats)} format(s) but no playable audio"
             )
 
+    cookie_state, _ = cookie_session_status()
     if any_audio:
         verdict = "✅ **Playback should work.**"
+        if YTDLP_COOKIES_FILE and not cookies_enabled():
+            verdict += " Cookies are disabled, which is required here: the anonymous client is the one with audio."
     elif saw_bot_wall:
-        verdict = (
-            "❌ **YouTube is blocking this host with a bot check.** Add a throwaway-account "
-            "`cookies.txt` (or `YTDLP_PROXY`); see the README's *YouTube bot check* section."
-        )
+        if YTDLP_PROXY:
+            verdict = (
+                "❌ **YouTube refused the proxy's IP with a bot check.** Try another proxy exit "
+                "(residential/mobile) and run `/ytcheck` again."
+            )
+        elif cookie_state == "signed_in":
+            verdict = (
+                "❌ **This host's IP is blocked, and cookies cannot fix it.** Signing in removes "
+                "`visionos` (the only client that returns direct audio), leaving image/SABR-only "
+                "streams. Set `YTDLP_PROXY` to a clean proxy or move to another host."
+            )
+        elif cookie_state in {"logged_out", "expired"}:
+            verdict = (
+                "❌ **This host's IP is blocked and the cookie file is "
+                f"{cookie_state}.** Re-export it from a signed-in browser, but expect the same "
+                "block: a flagged IP needs `YTDLP_PROXY` or a different host."
+            )
+        else:
+            verdict = (
+                "❌ **YouTube is blocking this host's IP.** A proxy (`YTDLP_PROXY`) is the "
+                "reliable fix; cookies alone also disable the client that returns audio."
+            )
     elif saw_no_audio:
-        verdict = (
-            "❌ **YouTube returned no playable audio.** Update `yt-dlp` to `>=2026.10.21`, "
-            "restart the bot, and run `/ytcheck` again."
-        )
+        if cookies_enabled():
+            verdict = (
+                "❌ **Only image/SABR streams were available with cookies.** This is a YouTube-side "
+                "change (yt-dlp #12482). Set `YTDLP_USE_COOKIES=never` and use a clean proxy so the "
+                "anonymous `visionos` client can resolve audio."
+            )
+        else:
+            verdict = (
+                "❌ **YouTube returned no playable audio.** Update `yt-dlp` to `>=2026.10.21`, "
+                "restart the bot, and run `/ytcheck` again."
+            )
     else:
         verdict = "❌ **Extraction failed.** Check the logs above and the bot's network access to YouTube."
 

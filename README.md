@@ -77,15 +77,15 @@ This bot is tuned to fit small plans such as **256 MB RAM / 512 MB disk**.
 The bot resolves audio with `yt-dlp` in a fixed order:
 
 1. **`YTDLP_PLAYER_CLIENT`**, if set — tried first, but never exclusive.
-2. **Anonymous `visionos` client** (no cookies). This client is token-free, so it
-   usually avoids the bot wall, and it exposes audio that the other clients hide.
-3. **Cookie clients** (`web_safari`, then `tv`) — only when a cookies file is configured.
-4. **Anonymous `web_safari`, then yt-dlp's default clients** — only when no cookies
-   are configured.
+2. **Anonymous `visionos` client** (no cookies). This is the only client yt-dlp
+   still gets direct audio URLs from for many tracks, including most music uploads.
+3. **Cookie clients** (`web_safari`, then `tv`) — only when cookies are enabled.
+4. **Anonymous `web_safari`, then yt-dlp's default clients** — when cookies are off.
 
-`visionos` is tried **before** cookies on purpose: yt-dlp drops that client as soon as
-the cookie file contains a signed-in session, and for many videos the authenticated
-clients return storyboard images with no audio at all.
+Cookies follow `YTDLP_USE_COOKIES` (default `auto`): **enabled without a proxy,
+disabled when `YTDLP_PROXY` is set**. This matters because a signed-in session makes
+yt-dlp drop `visionos`, and the remaining clients are served by YouTube as
+SABR-only streams that contain images but no audio (yt-dlp issue #12482).
 
 ### `Requested format is not available`
 
@@ -126,54 +126,126 @@ If logs show:
 ERROR: [youtube] ...: Sign in to confirm you're not a bot.
 ```
 
-YouTube is refusing the host's IP, not the song. Shared/datacenter IPs are commonly
-flagged. The bot tries the token-free `visionos` client first, then applies cookies
-when a cookies file is configured, and supports two optional overrides.
+YouTube is refusing the host's IP, not the song. Shared/datacenter IPs (Hetzner,
+OVH, Contabo, most free tiers) are commonly flagged. **Cookies rarely fix this**, for
+the reason above: signing in disables `visionos`, and the remaining clients only
+return SABR/image streams. The durable fix is a proxy with a clean IP.
 
-### 1. Export cookies (when the anonymous client is blocked)
+### 1. Proxy (the reliable fix)
 
-Use a **throwaway Google account**, never your main account.
+Set `YTDLP_PROXY` and, if the proxy is not local, `FFMPEG_PROXY` too. Audio URLs are
+bound to the IP that extracted them, so FFmpeg must use the same proxy that yt-dlp
+used or YouTube answers `403`.
 
-1. Open a private/incognito window and sign in to <https://www.youtube.com> with the
-   throwaway account.
-2. Export cookies in **Netscape** format with an extension such as
-   *Get cookies.txt LOCALLY* (or `yt-dlp --cookies-from-browser` on a desktop).
-3. Upload the file as `cookies.txt` next to `bot.py` on the host, or set
-   `YTDLP_COOKIES_FILE` to its path. Alternatively, set `YTDLP_COOKIES_B64` to the
-   base64-encoded file contents.
-4. Restart the bot and run `/ytcheck`.
-5. Close the incognito window when done.
+```env
+YTDLP_PROXY=http://127.0.0.1:25344
+FFMPEG_PROXY=http://127.0.0.1:25344
+```
 
-Cookie files are credentials: they are listed in `.gitignore` and must never be
-committed. Re-export them if playback breaks again after a few days/weeks.
+`FFMPEG_PROXY` defaults to `YTDLP_PROXY`, so a single variable is enough.
 
-### 2. Force IPv4
+Requirements and limits:
+
+- The proxy must expose an **HTTP** listener. FFmpeg cannot use SOCKS.
+- FFmpeg **does not send proxy credentials**. Either run the proxy locally without
+  auth (recommended), or put an auth-forwarding listener in front of it. `/ytcheck`
+  flags this case as `credentials not supported`.
+- Datacenter proxies are often blocked too; residential/mobile exits work best.
+- Bandwidth: roughly 58 MB per hour at 130 kbps. Budget a few GB per month.
+
+#### Free option: Cloudflare WARP in userspace
+
+No root required, but it consumes ~25–40 MB RAM on a 256 MB host.
+
+```bash
+mkdir -p ~/warp && cd ~/warp
+# 1. account config (Linux amd64 build; check the releases page for your arch)
+curl -L -o wgcf https://github.com/ViRb3/wgcf/releases/latest/download/wgcf_2.2.28_linux_amd64
+chmod +x wgcf && ./wgcf register --accept-tos && ./wgcf generate
+# 2. userspace WireGuard exposing a local HTTP proxy
+curl -L -o wp.tar.gz https://github.com/pufferffish/wireproxy/releases/latest/download/wireproxy_linux_amd64.tar.gz
+tar xzf wp.tar.gz && chmod +x wireproxy
+```
+
+`wireproxy.conf` (copy `PrivateKey` and `Address` from `wgcf-profile.conf`):
+
+```ini
+[Interface]
+PrivateKey = <YOUR_PRIVATE_KEY>
+Address = 172.16.0.2/32
+DNS = 1.1.1.1
+MTU = 1280
+
+[Peer]
+PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
+AllowedIPs = 0.0.0.0/0
+Endpoint = engage.cloudflareclient.com:2408
+
+[http]
+BindAddress = 127.0.0.1:25344
+```
+
+Start it before the bot (or from a `start.sh` that launches `wireproxy`, waits for
+the port, then `exec`s the bot), then verify:
+
+```bash
+curl -s --proxy http://127.0.0.1:25344 https://ipinfo.io/org
+python -m yt_dlp --proxy http://127.0.0.1:25344 --no-warnings \
+  --extractor-args "youtube:player_client=visionos" \
+  -f bestaudio/best -g "https://www.youtube.com/watch?v=87ilJONnFiM"
+```
+
+A printed URL means it works. If it still reports a bot check, WARP's ranges are also
+flagged — use a different proxy.
+
+### 2. Cookies (only as a last resort)
+
+Cookies are still supported, but with SABR in play they can make playback worse.
+Check what the file actually contains before relying on it:
+
+```bash
+grep -o -E 'LOGIN_INFO|SAPISID|__Secure-1PAPISID|__Secure-3PAPISID' cookies.txt | sort -u
+```
+
+You need `LOGIN_INFO` plus one `SAPISID`-family name, exported from a **logged-in,
+non-incognito** browser session using the **throwaway** account. `/ytcheck` reports
+the parsed state (`signed in`, `logged out`, `expired`).
+
+`YTDLP_USE_COOKIES` controls the policy:
+
+| Value | Behaviour |
+| :--- | :--- |
+| `auto` (default) | Cookies used only when `YTDLP_PROXY` is **not** set |
+| `always` | Cookies always used (accepts SABR-only results) |
+| `never` | Cookies ignored even if present |
+
+### 3. Force IPv4
 
 `YTDLP_FORCE_IPV4=true` is the default and equivalent to `yt-dlp -4`. Set it to
 `false` only if your host is IPv6-only.
 
-### 3. Optional overrides
+### 4. Optional overrides
 
 - `YTDLP_PLAYER_CLIENT` — comma-separated yt-dlp client override, e.g.
   `tv_samsung`, `visionos`, or `web_embedded`. Clients are scored differently and
   change every few weeks. It is tried first, then the `visionos`-first fallback chain
   described in [YouTube playback errors](#youtube-playback-errors) still runs, so a
   stale value cannot permanently break playback.
-- `YTDLP_PROXY` — proxy used only for yt-dlp extraction, e.g.
-  `http://user:pass@host:port`. A residential/mobile proxy is the durable fix when
-  the host IP itself is flagged and cookies alone stop working.
+- `YTDLP_PROXY` / `FFMPEG_PROXY` — see above. `FFMPEG_PROXY` defaults to
+  `YTDLP_PROXY`.
+- `YTDLP_USE_COOKIES` — `auto` / `always` / `never`.
 
 ### Host-side test
 
-Before restarting the bot, you can test the host Shell directly. First confirm the
-version — `2026.10.21` or newer is required:
+Before restarting the bot, confirm the version — `2026.10.21` or newer is required:
 
 ```bash
 python --version
 python -m yt_dlp --version
 ```
 
-Then test the same mode the bot uses first (anonymous `visionos`):
+Then test the mode the bot uses first (anonymous `visionos`), optionally through the
+proxy:
 
 ```bash
 python -m yt_dlp -4 --no-warnings --no-playlist -f bestaudio/best -g \
@@ -181,8 +253,8 @@ python -m yt_dlp -4 --no-warnings --no-playlist -f bestaudio/best -g \
   "ytsearch1:bu dünya yıkılsa üzülmem TUANA"
 ```
 
-If that prints a URL, the bot will play without cookies. If it only reports a bot
-check, test the cookie fallback:
+If that prints a URL, the bot will play. If it only reports a bot check, the host IP
+is flagged: add a proxy (above) rather than cookies. Cookies can still be tested:
 
 ```bash
 python -m yt_dlp -4 --cookies cookies.txt --no-warnings --no-playlist -f bestaudio/best -g \
@@ -190,5 +262,5 @@ python -m yt_dlp -4 --cookies cookies.txt --no-warnings --no-playlist -f bestaud
   "ytsearch1:bu dünya yıkılsa üzülmem TUANA"
 ```
 
-If the cookie test fails too, the IP is flagged and `YTDLP_PROXY` or a different host
-is required.
+If this prints a URL but `/ytcheck` shows `format(s) but no playable audio`, the
+client was served SABR-only content — your cookies "work" but cannot produce audio.
