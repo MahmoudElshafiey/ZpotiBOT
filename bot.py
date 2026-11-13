@@ -191,30 +191,34 @@ def get_ytdlp_version() -> str:
 def extraction_attempts() -> list[tuple[Optional[tuple[str, ...]], bool]]:
     """Returns (player_clients, use_cookies) attempts in priority order.
 
-    ``visionos`` is tried anonymously first:
+    The primary mode is anonymous ``visionos`` (after any explicit override):
       * it is token-free, so it avoids the bot wall that affects web/tv clients;
       * it exposes audio that the authenticated clients often hide (some videos
         only return storyboard images through web/web_embedded/tv_samsung);
       * yt-dlp skips ``visionos`` entirely when cookies make the session
         authenticated, so cookies must be a separate fallback attempt.
+
+    An explicit ``YTDLP_PLAYER_CLIENT`` is tried first but is *not* exclusive: a
+    stale override (for example ``tv_samsung``) must not be able to disable the
+    chain that makes playback work.
     """
     configured = _parse_clients(YTDLP_PLAYER_CLIENT)
     attempts: list[tuple[Optional[tuple[str, ...]], bool]] = []
 
     if configured:
-        # Respect an explicit override. Cookies are skipped for visionos because
-        # yt-dlp would discard that client when authenticated.
+        # Cookies are skipped for visionos because yt-dlp would discard that
+        # client when the cookie file makes the session authenticated.
         attempts.append((configured, bool(YTDLP_COOKIES_FILE) and "visionos" not in configured))
-    else:
-        attempts.append((("visionos",), False))
+
+    # Primary mode: anonymous (no cookies), token-free client.
+    attempts.append((("visionos",), False))
 
     # Cookie fallback: clients that support cookies and may bypass the bot wall.
     if YTDLP_COOKIES_FILE:
         attempts.append((("web_safari",), True))
         attempts.append((("tv",), True))
-
-    # Last-resort anonymous attempts when no cookie file is configured.
-    if not configured and not YTDLP_COOKIES_FILE:
+    else:
+        # Last-resort anonymous attempts when no cookie file is configured.
         attempts.append((("web_safari",), False))
         attempts.append((None, False))
 

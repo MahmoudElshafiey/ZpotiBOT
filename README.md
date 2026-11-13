@@ -76,10 +76,11 @@ This bot is tuned to fit small plans such as **256 MB RAM / 512 MB disk**.
 
 The bot resolves audio with `yt-dlp` in a fixed order:
 
-1. **Anonymous `visionos` client** (no cookies). This client is token-free, so it
+1. **`YTDLP_PLAYER_CLIENT`**, if set — tried first, but never exclusive.
+2. **Anonymous `visionos` client** (no cookies). This client is token-free, so it
    usually avoids the bot wall, and it exposes audio that the other clients hide.
-2. **Cookie clients** (`web_safari`, then `tv`) — only when a cookies file is configured.
-3. **Anonymous `web_safari`, then yt-dlp's default clients** — only when no cookies
+3. **Cookie clients** (`web_safari`, then `tv`) — only when a cookies file is configured.
+4. **Anonymous `web_safari`, then yt-dlp's default clients** — only when no cookies
    are configured.
 
 `visionos` is tried **before** cookies on purpose: yt-dlp drops that client as soon as
@@ -112,8 +113,10 @@ because the client only exposed storyboard images. Fixes, in order:
 4. If a single track still fails in every mode, it has no usable audio source; play
    another search result instead.
 
-`YTDLP_PLAYER_CLIENT` overrides the whole chain when set. Leave it empty unless you
-are debugging — pinning an old client such as `tv_samsung` is what causes this error.
+`YTDLP_PLAYER_CLIENT` is tried first but does not replace the chain: if the pinned
+client fails, the bot still falls back to anonymous `visionos` and then cookies.
+Leave it empty unless you are debugging — a stale value such as `tv_samsung` is
+exactly what used to cause this error.
 
 ## YouTube bot check
 
@@ -153,8 +156,9 @@ committed. Re-export them if playback breaks again after a few days/weeks.
 
 - `YTDLP_PLAYER_CLIENT` — comma-separated yt-dlp client override, e.g.
   `tv_samsung`, `visionos`, or `web_embedded`. Clients are scored differently and
-  change every few weeks. Leave it empty to use the `visionos`-first chain described
-  in [YouTube playback errors](#youtube-playback-errors).
+  change every few weeks. It is tried first, then the `visionos`-first fallback chain
+  described in [YouTube playback errors](#youtube-playback-errors) still runs, so a
+  stale value cannot permanently break playback.
 - `YTDLP_PROXY` — proxy used only for yt-dlp extraction, e.g.
   `http://user:pass@host:port`. A residential/mobile proxy is the durable fix when
   the host IP itself is flagged and cookies alone stop working.
